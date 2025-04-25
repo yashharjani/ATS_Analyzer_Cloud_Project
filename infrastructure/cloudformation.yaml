@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "ATS Resume Scanner with Step Functions Workflow and Dockerized Elastic Beanstalk Frontend"
+
+Parameters:
+  GeminiApiKey:
+    Type: String
+    Description: Gemini API key for ATS analysis
+    NoEcho: true
+
+Resources:
+  GeminiApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ats-analyzer/gemini-api-key
+      Type: String
+      Value: !Ref GeminiApiKey
+      Description: Gemini API key for ATS Analyzer
+
+  # S3 Bucket for Resume Storage
+  ResumeS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ats-resume-storage
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["PUT"]
+            AllowedOrigins: ["*"]
+            Id: myCORSRuleId1
+            MaxAge: 3600
+
+  # Elastic Beanstalk Application
+  ATSFrontendApp:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: ATSFrontendApplication
+
+  # Elastic Beanstalk Application Version
+  ATSFrontendAppVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref ATSFrontendApp
+      Description: "ATS Frontend Docker Application Version"
+      SourceBundle:
+        S3Bucket: ats-frontend-eb-versions-309683155489
+        S3Key: Dockerrun.aws.json
+
+  # Elastic Beanstalk Environment
+  ATSFrontendEnv:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref ATSFrontendApp
+      EnvironmentName: ATSFrontendEnv
+      SolutionStackName: "64bit Amazon Linux 2 v4.1.0 running Docker"
+      VersionLabel: !Ref ATSFrontendAppVersion
+      OptionSettings:
+        - Namespace: "aws:autoscaling:launchconfiguration"
+          OptionName: "IamInstanceProfile"
+          Value: !Ref EBInstanceProfile
+        - Namespace: "aws:elasticbeanstalk:environment"
+          OptionName: "EnvironmentType"
+          Value: "SingleInstance"
+        - Namespace: "aws:elasticbeanstalk:environment"
+          OptionName: "ServiceRole"
+          Value: arn:aws:iam::309683155489:role/LabRole
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: "REACT_APP_API_URL"
+          Value: !Sub "https://${ResumeUploadApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}"
+        - Namespace: "aws:elasticbeanstalk:application"
+          OptionName: "Application Healthcheck URL"
+          Value: "/"
+
+  # IAM Instance Profile for Elastic Beanstalk Instances
+  EBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ATSFrontendInstanceProfile
+      Roles:
+        - "LabRole"
+
+  # Step Functions State Machine
+  ResumeProcessingWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ResumeProcessingWorkflow
+      RoleArn: arn:aws:iam::309683155489:role/LabRole
+      DefinitionString: !Sub |
+        {
+          "Comment": "Workflow for resume upload, processing, and ATS analysis",
+          "StartAt": "UploadToS3",
+          "States": {
+            "UploadToS3": {
+              "Type": "Task",
+              "Resource": "${ResumeUploadLambda.Arn}",
+              "ResultPath": "$.uploadResult",
+              "Next": "ExtractWorkflowInput"
+            },
+            "ExtractWorkflowInput": {
+              "Type": "Pass",
+              "ResultPath": "$.workflow_input",
+              "Parameters": {
+                "workflow_input.$": "$"
+              },
+              "Next": "ProcessResume"
+            },
+            "ProcessResume": {
+              "Type": "Task",
+              "Resource": "${ResumeProcessorLambda.Arn}",
+              "InputPath": "$.workflow_input",
+              "ResultPath": "$.processResult",
+              "Next": "AnalyzeATS"
+            },
+            "AnalyzeATS": {
+              "Type": "Task",
+              "Resource": "${ATSAnalysisLambda.Arn}",
+              "InputPath": "$.processResult",
+              "ResultPath": "$.analysisResult",
+              "End": true
+            }
+          }
+        }
+
+  # Resume Upload Lambda
+  ResumeUploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResumeUploadHandler
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Role: arn:aws:iam::309683155489:role/LabRole
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ResumeS3Bucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          import base64
+          import uuid
+
+          s3_client = boto3.client('s3')
+          sfn_client = boto3.client('stepfunctions')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = os.environ['BUCKET_NAME']
+                  region = os.environ.get('AWS_REGION', 'us-east-1')
+                  account_id = '309683155489'
+                  state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:ResumeProcessingWorkflow"
+
+                  body = json.loads(event.get('body', '{}'))
+                  file_content = body.get('file_content')
+                  file_name = body.get('file_name')
+                  job_description = body.get('job_description', '')
+
+                  if not file_content or not file_name or not job_description:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps('Error: file_content, file_name, and job_description required')
+                      }
+
+                  if file_content.startswith('data:'):
+                      header, encoded = file_content.split(",", 1)
+                      file_content = base64.b64decode(encoded)
+
+                  s3_client.put_object(Body=file_content, Bucket=bucket_name, Key=file_name)
+
+                  result_id = f"assoc_{uuid.uuid4()}"
+
+                  workflow_input = {
+                      'file_name': file_name,
+                      'bucket_name': bucket_name,
+                      'job_description': job_description,
+                      'user_id': 'default_user',
+                      'result_id': result_id
+                  }
+
+                  response = sfn_client.start_execution(
+                      stateMachineArn=state_machine_arn,
+                      input=json.dumps(workflow_input)
+                  )
+
+                  return {
+                      'statusCode': 202,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({
+                          'message': 'Processing started',
+                          'executionArn': response['executionArn'],
+                          'resume_id': file_name,
+                          'result_id': result_id
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  # Resume Processor Lambda
+  ResumeProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResumeProcessor
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Role: arn:aws:iam::309683155489:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: ResumeDataTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          textract = boto3.client('textract')
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  input_data = event.get('workflow_input', {})
+                  file_name = input_data['file_name']
+                  bucket = input_data['bucket_name']
+                  job_description = input_data.get('job_description', '')
+                  user_id = input_data.get('user_id', 'default_user')
+                  result_id = input_data.get('result_id')
+
+                  table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+                  response = textract.detect_document_text(
+                      Document={'S3Object': {'Bucket': bucket, 'Name': file_name}}
+                  )
+                  extracted_text = "\n".join(
+                      item['Text'] for item in response['Blocks'] if item['BlockType'] == 'LINE'
+                  )
+
+                  table.put_item(Item={
+                      'resume_id': file_name,
+                      'text': extracted_text,
+                      'user_id': user_id,
+                      'job_description': job_description,
+                      'result_id': result_id
+                  })
+
+                  return {
+                      'resume_id': file_name,
+                      'job_description': job_description,
+                      'user_id': user_id,
+                      'result_id': result_id
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing resume: {str(e)}")
+                  raise
+      Timeout: 60
+
+  # ATS Analysis Lambda
+  ATSAnalysisLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: [GeminiApiKeyParameter]
+    Properties:
+      FunctionName: ATSAnalysisHandler
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Role: arn:aws:iam::309683155489:role/LabRole
+      Environment:
+        Variables:
+          RESUME_TABLE: ResumeDataTable
+          RESULTS_TABLE: ATSResultsTable
+          SSM_PARAMETER_NAME: /ats-analyzer/gemini-api-key
+      Code:
+        S3Bucket: ats-analyzer-s3
+        S3Key: gemini_ats_score_2.zip
+      Timeout: 60
+      MemorySize: 512
+
+  # Single Result Fetching Lambda
+  ATSResultsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ATSResultsFetcher
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Role: arn:aws:iam::309683155489:role/LabRole
+      Environment:
+        Variables:
+          RESULTS_TABLE: ATSResultsTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  result_id = query_params.get('result_id')
+
+                  if not result_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': 'result_id is required'})
+                      }
+
+                  results_table = dynamodb.Table('ATSResultsTable')
+                  response = results_table.get_item(Key={'result_id': result_id})
+
+                  if 'Item' not in response:
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': f'No results found for result_id: {result_id}'})
+                      }
+
+                  result = response['Item']
+                  if 'ats_score' in result:
+                      result['ats_score'] = float(result['ats_score'])
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({
+                          'result_id': result.get('result_id'),
+                          'resume_id': result.get('resume_id'),
+                          'user_id': result.get('user_id'),
+                          'ats_score': result.get('ats_score'),
+                          'matched_keywords': result.get('matched_keywords', []),
+                          'missing_keywords': result.get('missing_keywords', []),
+                          'resume_keywords': result.get('resume_keywords', []),
+                          'job_keywords': result.get('job_keywords', []),
+                          'job_description': result.get('job_description', '')
+                      }, default=str)
+                  }
+              except Exception as e:
+                  logger.error(f"Error fetching results: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': f'Error fetching results: {str(e)}'})
+                  }
+      Timeout: 30
+
+  # All Results Fetching Lambda
+  ATSAllResultsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ATSAllResultsFetcher
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Role: arn:aws:iam::309683155489:role/LabRole
+      Environment:
+        Variables:
+          RESULTS_TABLE: ATSResultsTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  user_id = query_params.get('user_id', 'default_user')
+
+                  results_table = dynamodb.Table('ATSResultsTable')
+                  response = results_table.scan(
+                      FilterExpression='user_id = :user_id',
+                      ExpressionAttributeValues={':user_id': user_id}
+                  )
+
+                  items = response.get('Items', [])
+                  results = []
+                  for item in items:
+                      if 'ats_score' in item:
+                          item['ats_score'] = float(item['ats_score'])
+                      results.append({
+                          'result_id': item.get('result_id'),
+                          'resume_id': item.get('resume_id'),
+                          'user_id': item.get('user_id'),
+                          'ats_score': item.get('ats_score'),
+                          'missing_keywords': item.get('missing_keywords', []),
+                          'job_description': item.get('job_description', ''),
+                          'created_at': item.get('created_at')
+                      })
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'results': results}, default=str)
+                  }
+              except Exception as e:
+                  logger.error(f"Error fetching all results: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': f'Error fetching all results: {str(e)}'})
+                  }
+      Timeout: 30
+
+  # API Gateway
+  ResumeUploadApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ResumeUploadApi
+      Description: API Gateway for ATS Resume Scanner
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # Upload Resource and Methods
+  ResumeUploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ResumeUploadApi.RootResourceId
+      PathPart: upload
+      RestApiId: !Ref ResumeUploadApi
+
+  ResumeUploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ResumeUploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResumeUploadLambda.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ResumeUploadOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ResumeUploadResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Single Result Resource and Methods
+  ATSResultsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ResumeUploadApi.RootResourceId
+      PathPart: results
+      RestApiId: !Ref ResumeUploadApi
+
+  ATSResultsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ATSResultsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.result_id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ATSResultsLambda.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ATSResultsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ATSResultsResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # All Results Sub-Resource and Methods
+  ATSAllResultsSubResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ATSResultsResource
+      PathPart: all
+      RestApiId: !Ref ResumeUploadApi
+
+  ATSAllResultsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ATSAllResultsSubResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.user_id: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ATSAllResultsLambda.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ATSAllResultsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref ATSAllResultsSubResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  LambdaATSResultsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ATSResultsLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResumeUploadApi}/*/GET/results"
+
+  LambdaATSAllResultsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ATSAllResultsLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResumeUploadApi}/*/GET/results/all"
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ResumeUploadLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResumeUploadApi}/*/POST/upload"
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ResumeUploadMethod
+      - ResumeUploadOptionsMethod
+      - ATSResultsMethod
+      - ATSResultsOptionsMethod
+      - ATSAllResultsMethod
+      - ATSAllResultsOptionsMethod
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref ResumeUploadApi
+      DeploymentId: !Ref ApiGatewayDeployment
+
+  # DynamoDB Tables
+  ResumeDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ResumeDataTable
+      AttributeDefinitions:
+        - AttributeName: resume_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resume_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ATSResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ATSResultsTable
+      AttributeDefinitions:
+        - AttributeName: result_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: result_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+Outputs:
+  POSTUploadAPIGatewayURL:
+    Description: "API Gateway URL for upload api"
+    Value: !Sub "https://${ResumeUploadApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}/upload"
+  ResultsAPIGatewayURL:
+    Description: "API Gateway URL for results api"
+    Value: !Sub "https://${ResumeUploadApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}/results"
+  AllResultsAPIGatewayURL:
+    Description: "API Gateway URL for all results api"
+    Value: !Sub "https://${ResumeUploadApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}/results/all"
+  ATSFrontendURL:
+    Description: "Elastic Beanstalk URL for the frontend"
+    Value: !GetAtt ATSFrontendEnv.EndpointURL

@@ -1,0 +1,16 @@
+{
+  "AWSEBDockerrunVersion": "1",
+  "Image": {
+    "Name": "309683155489.dkr.ecr.us-east-1.amazonaws.com/ats-frontend:latest",
+    "Update": "true"
+  },
+  "Ports": [
+    {
+      "ContainerPort": 3000,
+      "HostPort": 80
+    }
+  ],
+  "Environment": {
+    "REACT_APP_API_URL": ""
+  }
+}
